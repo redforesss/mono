@@ -1049,6 +1049,45 @@ mono_debugger_agent_parse_options (char *options)
 	}
 }
 
+static void
+set_mdb_optimizations (gboolean enable)
+{
+#ifndef RUNTIME_IL2CPP
+	mini_get_debug_options ()->gen_sdb_seq_points = enable;
+	/*
+	 * This is needed because currently we don't handle liveness info.
+	 */
+	mini_get_debug_options ()->mdb_optimizations = enable;
+
+#ifndef MONO_ARCH_HAVE_CONTEXT_SET_INT_REG
+	/* This is needed because we can't set local variables in registers yet */
+	mono_disable_optimizations (MONO_OPT_LINEARS);
+#endif
+
+	/*
+	 * The stack walk done from thread_interrupt () needs to be signal safe, but it
+	 * isn't, since it can call into mono_aot_find_jit_info () which is not signal
+	 * safe (#3411). So load AOT info eagerly when the debugger is running as a
+	 * workaround.
+	 */
+	mini_get_debug_options ()->load_aot_jit_info_eagerly = enable;
+#endif // !RUNTIME_IL2CPP
+}
+
+MONO_API void
+mono_debugger_set_disable_optimizations (gboolean enable)
+{
+	set_mdb_optimizations (enable);
+}
+
+typedef void (*MonoDebuggerAttachFunc)(gboolean attached);
+static MonoDebuggerAttachFunc attach_func;
+MONO_API void
+mono_debugger_install_attach_detach_callback (MonoDebuggerAttachFunc func)
+{
+	attach_func = func;
+}
+
 void
 mono_debugger_agent_init (void)
 {
@@ -1116,26 +1155,8 @@ mono_debugger_agent_init (void)
 	breakpoints_init ();
 	suspend_init ();
 
-#ifndef RUNTIME_IL2CPP
-	mini_get_debug_options ()->gen_sdb_seq_points = TRUE;
-	/* 
-	 * This is needed because currently we don't handle liveness info.
-	 */
-	mini_get_debug_options ()->mdb_optimizations = TRUE;
-
-#ifndef MONO_ARCH_HAVE_CONTEXT_SET_INT_REG
-	/* This is needed because we can't set local variables in registers yet */
-	mono_disable_optimizations (MONO_OPT_LINEARS);
-#endif
-
-	/*
-	 * The stack walk done from thread_interrupt () needs to be signal safe, but it
-	 * isn't, since it can call into mono_aot_find_jit_info () which is not signal
-	 * safe (#3411). So load AOT info eagerly when the debugger is running as a
-	 * workaround.
-	 */
-	mini_get_debug_options ()->load_aot_jit_info_eagerly = TRUE;
-#endif // !RUNTIME_IL2CPP
+	if (!agent_config.defer)
+		set_mdb_optimizations (TRUE);
 
 #ifdef HAVE_SETPGID
 	if (agent_config.setpgid)
@@ -4630,6 +4651,8 @@ insert_breakpoint (MonoSeqPointInfo *seq_points, MonoDomain *domain, MonoJitInfo
 			mini_get_interp_callbacks ()->set_breakpoint (ji, inst->ip);
 		} else {
 #ifdef MONO_ARCH_SOFT_DEBUG_SUPPORTED
+			if (ji->dbg_ignore)
+				return;
 			mono_arch_set_breakpoint (ji, inst->ip);
 #else
 			NOT_IMPLEMENTED;
@@ -11963,6 +11986,9 @@ debugger_thread (void *arg)
 			attach_failed = TRUE; // Don't abort process when we can't listen
 		} else {
 			mono_set_is_debugger_attached (TRUE);
+			set_mdb_optimizations (TRUE);
+			if (attach_func)
+				attach_func (TRUE);
 			/* Send start event to client */
 			process_profiler_event (EVENT_KIND_VM_START, mono_thread_get_main ());
 #ifdef RUNTIME_IL2CPP
@@ -11979,6 +12005,9 @@ debugger_thread (void *arg)
 		}
 	} else {
 		mono_set_is_debugger_attached (TRUE);
+		set_mdb_optimizations (TRUE);
+		if (attach_func)
+			attach_func (TRUE);
 	}
 	
 	while (!attach_failed) {
@@ -12113,6 +12142,9 @@ debugger_thread (void *arg)
 	}
 
 	mono_set_is_debugger_attached (FALSE);
+	set_mdb_optimizations (FALSE);
+	if (attach_func)
+		attach_func (FALSE);
 
 #ifdef RUNTIME_IL2CPP
 	il2cpp_mono_free_method_signatures();
